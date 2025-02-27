@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use eyre::{bail, Context, ContextCompat};
 use itertools::Itertools;
@@ -11,19 +11,19 @@ pub struct Abbreviation<'a> {
 
 #[derive(Default)]
 pub struct Abbreviator {
-    lowercase_matchers: HashMap<String, Abbrev>,
+    has_matchers: bool,
+    replace_matchers: HashMap<String, Abbrev>,
+    remove_matchers: HashSet<String>,
     regex_matchers: Vec<Abbrev>,
 }
 
 impl Abbreviator {
-    pub fn from_file(file_path: &Path) -> eyre::Result<Abbreviator> {
-        let file = std::fs::read_to_string(file_path)
-            .context("Failed to read abbreviations file")?;
-
-        let mut lowercase_matchers = HashMap::new();
+    pub fn from_lines<'a, I: Iterator<Item = &'a str>>(lines: I) -> eyre::Result<Abbreviator> {
+        let mut replace_matchers = HashMap::new();
+        let mut remove_matchers = HashSet::new();
         let mut regex_matchers = Vec::new();
 
-        for line in file.lines() {
+        for line in lines {
             let line = line.trim();
 
             // Skip empty lines and comments
@@ -34,7 +34,11 @@ impl Abbreviator {
             let abbrev = parse_abbrev(line)?;
             match &abbrev.matcher {
                 AbbrevMatcher::Lowercase(matcher) => {
-                    lowercase_matchers.insert(matcher.clone(), abbrev);
+                    if abbrev.abbrev.is_empty() {
+                        remove_matchers.insert(matcher.clone());
+                    } else {
+                        replace_matchers.insert(matcher.clone(), abbrev);
+                    }
                 }
                 AbbrevMatcher::Regex(_) => {
                     regex_matchers.push(abbrev);
@@ -42,11 +46,22 @@ impl Abbreviator {
             }
         }
 
-        Ok(Abbreviator { lowercase_matchers, regex_matchers })
+        let empty = replace_matchers.is_empty()
+            && remove_matchers.is_empty()
+            && regex_matchers.is_empty();
+
+        Ok(Abbreviator { has_matchers: !empty, replace_matchers, remove_matchers, regex_matchers })
+    }
+
+    pub fn try_from_file(file_path: &Path) -> eyre::Result<Abbreviator> {
+        let file = std::fs::read_to_string(file_path)
+            .context("Failed to read abbreviations file")?;
+
+        Self::from_lines(file.lines())
     }
 
     pub fn abbreviate(&self, text: &str) -> Option<Abbreviation> {
-        if self.lowercase_matchers.is_empty() && self.regex_matchers.is_empty() {
+        if !self.has_matchers {
             return None;
         }
 
@@ -55,7 +70,11 @@ impl Abbreviator {
             .split_whitespace()
             .join(" ");
 
-        let abbrev = self.lowercase_matchers.get(&lowercase);
+        if self.remove_matchers.contains(&lowercase) {
+            return Some(Abbreviation { text: "", attach_to_previous: true });
+        }
+
+        let abbrev = self.replace_matchers.get(&lowercase);
         if let Some(abbrev) = abbrev {
             return Some(abbrev.with_matching_case_to(text));
         }
@@ -65,7 +84,7 @@ impl Abbreviator {
                 continue
             };
 
-            if re.is_match(&text) {
+            if re.is_match(text) {
                 return Some(abbrev.with_matching_case_to(text));
             }
         }
@@ -126,13 +145,12 @@ fn parse_abbrev(line: &str) -> eyre::Result<Abbrev> {
         None
     };
 
-    if matcher.starts_with('/') {
-        let matcher = &matcher[1..];
-        let Some(closing_pos) = matcher.find('/') else {
+    if let Some(regex_matcher) = matcher.strip_prefix('/') {
+        let Some(closing_pos) = regex_matcher.find('/') else {
             bail!("Invalid regex, no closing '/' found");
         };
-        let flags = &matcher[closing_pos + 1..];
-        let re = RegexBuilder::new(&matcher[..closing_pos])
+        let flags = &regex_matcher[closing_pos + 1..];
+        let re = RegexBuilder::new(&regex_matcher[..closing_pos])
             .case_insensitive(flags.contains('i'))
             .build()?;
 

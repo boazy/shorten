@@ -1,14 +1,10 @@
 use crate::abbrev::{Abbreviation, Abbreviator};
-use crate::stop_words::STOP_WORDS;
 use eyre::Context;
-use itertools::Itertools;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use xdg::BaseDirectories;
 
 pub struct Shortener {
     desired_max_length: usize,
-    stop_words: HashSet<&'static str>,
     abbreviator: Abbreviator,
 }
 
@@ -19,14 +15,20 @@ impl Shortener {
 
         let abbrev_path = base_dirs.get_config_file("abbrev.lst");
         let abbreviator = if abbrev_path.exists() {
-            Abbreviator::from_file(&abbrev_path).context("Failed to load abbreviations")?
+            Abbreviator::try_from_file(&abbrev_path).context("Failed to load abbreviations")?
         } else {
             Abbreviator::default()
         };
 
+        Self::with_abbreviator(desired_max_length, abbreviator)
+    }
+
+    pub fn with_abbreviator(
+        desired_max_length: usize,
+        abbreviator: Abbreviator,
+    ) -> eyre::Result<Shortener> {
         Ok(Shortener {
             desired_max_length,
-            stop_words: HashSet::from_iter(STOP_WORDS.iter().map(|s| *s)),
             abbreviator,
         })
     }
@@ -41,19 +43,39 @@ impl Shortener {
             return Cow::Borrowed(trimmed);
         }
 
-        let without_stop_words = trimmed
-            .split_whitespace()
-            .filter(|s| !self.stop_words.contains(s))
-            .join(" ");
-
-        if without_stop_words.len() <= self.desired_max_length {
-            return Cow::Owned(without_stop_words);
-        };
-
-        let words = without_stop_words.split_whitespace();
+        let words = trimmed.split_whitespace();
         let mut prev_word: Option<&str> = None;
-        let mut abbreviated = String::with_capacity(without_stop_words.len());
+        let mut abbreviated = String::with_capacity(trimmed.len());
         for word in words {
+            let enclosed = process_enclosed_word(word);
+
+            // Attempt raw enclosed abbreviation before removing enclosing
+            if enclosed.is_enclosed() {
+                if let Some(found_prev_word) = prev_word {
+                    self.abbrev_or_add(&mut abbreviated, found_prev_word);
+                    prev_word = None;
+                }
+                if !self.attempt_abbrev(&mut abbreviated, word) {
+                    // Remove enclosing and try word individually
+                    let abbrev = self.abbreviator.abbreviate(enclosed.word);
+                    match abbrev {
+                        Some(abbrev) => {
+                            if !abbrev.text.is_empty() {
+                                abbreviated.add_with_space(enclosed.openers);
+                                abbreviated.add_abbrev(abbrev);
+                                abbreviated.push_str(enclosed.closers);
+                            }
+                        }
+                        None => {
+                            abbreviated.add_with_space(enclosed.openers);
+                            self.abbrev_or_add(&mut abbreviated, enclosed.word);
+                            abbreviated.push_str(enclosed.closers);
+                        }
+                    }
+                }
+                continue;
+            }
+
             let Some(found_prev_word) = prev_word else {
                 prev_word = Some(word);
                 continue;
@@ -67,7 +89,7 @@ impl Shortener {
                 self.abbrev_or_add(&mut abbreviated, found_prev_word);
                 prev_word = Some(word);
             }
-        };
+        }
 
         // If there's a word left over, add it to the output (abbreviated or not)
         if let Some(prev_word) = prev_word {
@@ -78,7 +100,8 @@ impl Shortener {
     }
 
     fn attempt_abbrev(&self, abbreviated: &mut String, text: &str) -> bool {
-        self.abbreviator.abbreviate(text)
+        self.abbreviator
+            .abbreviate(text)
             .map(|abbrev| abbreviated.add_abbrev(abbrev))
             .is_some()
     }
@@ -98,18 +121,121 @@ trait AddWithSpace {
 
 impl AddWithSpace for String {
     fn add_with_space(&mut self, s: &str) {
-        if !self.is_empty() {
+        if s.is_empty() {
+            return;
+        }
+
+        let is_opener = self
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_opener());
+
+        if !is_opener && !self.is_empty() {
             self.push(' ');
         }
         self.push_str(s);
     }
 
     fn add_abbrev(&mut self, abbrev: Abbreviation) {
+        if abbrev.text.is_empty() {
+            return;
+        }
         if abbrev.attach_to_previous {
             self.push_str(abbrev.text);
-        }
-        else {
+        } else {
             self.add_with_space(abbrev.text);
+        }
+    }
+}
+
+trait Enclosing {
+    fn is_opener(&self) -> bool;
+    fn is_closer(&self) -> bool;
+}
+
+impl Enclosing for char {
+    fn is_opener(&self) -> bool {
+        matches!(
+            self,
+            '(' | '[' | '{' | '<' | '"' | '*'
+        )
+    }
+    fn is_closer(&self) -> bool {
+        matches!(
+            self,
+            ')' | ']' | '}' | '>' | '"' | '*'
+        )
+    }
+}
+
+struct EnclosedWord<'a> {
+    word: &'a str,
+    openers: &'a str,
+    closers: &'a str,
+}
+
+impl EnclosedWord<'_> {
+    fn is_enclosed(&self) -> bool {
+        !self.openers.is_empty() || !self.closers.is_empty()
+    }
+}
+
+fn process_enclosed_word(input: &str) -> EnclosedWord {
+    let opener_len = input.chars().take_while(|c| c.is_opener()).count();
+    let closer_len = input.chars().rev().take_while(|c| c.is_closer()).count();
+    EnclosedWord {
+        word: &input[opener_len..input.len() - closer_len],
+        openers: &input[..opener_len],
+        closers: &input[input.len() - closer_len..],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::iter::zip;
+    use crate::abbrev::Abbreviator;
+    use crate::shortener::Shortener;
+
+    #[test]
+    fn test_shorten() {
+        let lines: Vec<&str> = r#"
+            Architecture              = arch
+            Learning                  = learn
+            Audience                  = audn
+            Session                   = sesn
+            Excellence                = excl
+            Section                   = <+課
+            Department                = <+部
+            Weekly                    = 毎週
+            Monthly                   = 毎月
+
+            One = 1
+
+            Meeeting =
+            Rescheduled =
+            [Monthly] = [M]
+            [Weekly] = [W]
+        "#.split('\n').collect();
+        let abbreviator = Abbreviator::from_lines(lines.into_iter()).unwrap();
+        let shortener = Shortener::with_abbreviator(10, abbreviator).unwrap();
+
+        let input = vec![
+            "Architecture Section Learning Session",
+            "*Rescheduled* [W] MPD Architecture Excellence Group Weekly Connect",
+            "[Monthly] CLSD All Hands Meeting *Rescheduled*",
+            "RIAM Tech Camp (Session one)",
+        ];
+
+        let expected= vec![
+            "Arch課 Learn Sesn",
+            "[W] MPD Arch Excl Group 毎週 Connect",
+            "[M] CLSD All Hands Meeting",
+            "RIAM Tech Camp (Sesn 1)",
+        ];
+
+        for (input, expected) in zip(input, expected) {
+            let shortened = shortener.shorten(input);
+            assert_eq!(shortened, expected);
         }
     }
 }

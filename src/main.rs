@@ -1,11 +1,10 @@
-use std::env::args;
-use std::io::stdin;
 use eyre::Context;
 use itertools::Itertools;
+use std::env::args;
+use std::io::stdin;
 
-mod shortener;
-mod stop_words;
 mod abbrev;
+mod shortener;
 
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
@@ -18,7 +17,8 @@ fn main() -> eyre::Result<()> {
         }
     };
 
-    let desired_max_length = desired_max_length.parse::<usize>()
+    let desired_max_length = desired_max_length
+        .parse::<usize>()
         .context("Failed to parse desired max length as an integer")?;
 
     let shortener = shortener::Shortener::new(desired_max_length)?;
@@ -27,7 +27,7 @@ fn main() -> eyre::Result<()> {
         let line = line?;
         let shortened = shortener.shorten(&line);
         println!("{}", shortened);
-    };
+    }
 
     Ok(())
 }
